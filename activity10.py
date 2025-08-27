@@ -1,3 +1,5 @@
+from getpass import getpass
+
 def checker(username, password):
 	if (username == 'Arnulfo') and (password == 'arnulfo118'):
 		print("User Logged in")
@@ -8,6 +10,6 @@ def checker(username, password):
 
 def login():
 	username = input("Enter username.. ")
-	password = input("Enter password.. ")
+	password = getpass("Enter password.. ")
 	checker(username, password)
 login()
