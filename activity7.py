@@ -12,4 +12,5 @@ a -= 1
 a *= 50
 a **= 2
 
+
 print("The value of a is", a)
