@@ -1,0 +1,1859 @@
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TweenService = game:GetService("TweenService")
+local ServerScriptService = game:GetService("ServerScriptService")
+local PlayerDataManager = require(ServerScriptService.SSS.Data.PlayerDataManager)
+
+-- Configuration
+local REQUIRED_PLAYERS = 1
+local WAIT_DELAY = 5 -- Seconds to wait after all players join
+
+-- Remote event for screen fading
+local fadeEvent = Instance.new("RemoteEvent")
+fadeEvent.Name = "ScreenFadeEvent"
+fadeEvent.Parent = ReplicatedStorage
+
+
+
+-- Track loaded players
+local loadedPlayers = 0
+local elevatorAnimationStarted = false
+
+-- ✅ Initialize loot tracker once, not per player
+PlayerDataManager:InitCaveLootTracker()
+
+-- Elevator animation function
+local function startElevatorAnimation()
+	if elevatorAnimationStarted then return end
+	elevatorAnimationStarted = true
+
+	print("All players loaded! Starting elevator sequence...")
+
+	-- Tell all clients to fade out their black screens
+	fadeEvent:FireAllClients()
+
+	task.wait(5) -- Give players time to settle
+
+	local model = workspace:FindFirstChild("Elevator")
+	if not model or not model.PrimaryPart then return end
+
+	local originalPositions = {}
+	local partsToAnimate = {}
+
+	for _, part in ipairs(model:GetDescendants()) do
+		if part:IsA("BasePart") then
+			part.Anchored = true
+			originalPositions[part] = part.Position
+			table.insert(partsToAnimate, part)
+		end
+	end
+
+	-- Target positions (down 50 studs)
+	local tweens = {}
+	for _, part in ipairs(partsToAnimate) do
+		local target = originalPositions[part] + Vector3.new(0, -50, 0)
+		local tween = TweenService:Create(part, TweenInfo.new(
+			20, Enum.EasingStyle.Linear
+			), {Position = target})
+		table.insert(tweens, tween)
+	end
+
+	for _, tween in ipairs(tweens) do
+		tween:Play()
+	end
+
+	if #tweens > 0 then
+		tweens[1].Completed:Connect(function()
+			for _, part in ipairs(partsToAnimate) do
+				part.Anchored = false
+			end
+		end)
+	end
+end
+
+local function checkAndStartElevator()
+	if loadedPlayers >= REQUIRED_PLAYERS and not elevatorAnimationStarted then
+		startElevatorAnimation()
+	end
+end
+
+-- Player join handler
+local function onPlayerJoin(player)
+	player.CharacterAdded:Connect(function(character)
+		character:WaitForChild("HumanoidRootPart")
+
+		-- Track player as loaded only once
+		if not player:GetAttribute("LoadedForElevator") then
+			player:SetAttribute("LoadedForElevator", true)
+			loadedPlayers += 1
+			print("Player loaded: " .. player.Name .. " (" .. loadedPlayers .. "/" .. REQUIRED_PLAYERS .. ")")
+			checkAndStartElevator()
+			-- Start cave session once when they join this place
+			PlayerDataManager.StartCaveSession(player)
+		end
+
+		-- Handle death
+		local hum = character:WaitForChild("Humanoid")
+		hum.Died:Connect(function()
+			PlayerDataManager.HandleCaveDeath(player)
+		end)
+	end)
+end
+
+-- Initialize for existing players
+for _, player in ipairs(Players:GetPlayers()) do
+	onPlayerJoin(player)
+end
+
+Players.PlayerAdded:Connect(onPlayerJoin)
+
+local CS = game:GetService("CollectionService")
+local RS = game:GetService("ReplicatedStorage"):WaitForChild("RS")
+local SS = game:GetService("ServerStorage"):WaitForChild("SS")
+local SSS = game:GetService("ServerScriptService"):WaitForChild("SSS")
+local TweenService = game:GetService("TweenService")
+
+
+local Server = SSS:WaitForChild("Server")
+
+local OreDecalManager = require(Server:WaitForChild("OreDecalManager"))
+local OreUtils = require(Server:WaitForChild("OreUtils"))
+local OreVariantManager = require(Server:WaitForChild("OreVariantManager"))
+local OreDropManager = require(Server:WaitForChild("OreDropManager"))
+local BreakEffectManager = require(Server:WaitForChild("BreakEffectManager"))
+
+local PlayerDataManager = require(SSS:WaitForChild("Data"):WaitForChild("PlayerDataManager"))
+local StatsManager = require(SSS:WaitForChild("Server"):WaitForChild("StatsCore"))
+
+local Templates = RS.Templates
+
+local PickaxeTemplate = require(Templates.PickaxeTemplate)
+local ModifierTemplate = require(Templates.ModifiersTemplate)
+local StatsConfig = require(Server.StatsConfig)
+
+local Remotes = RS:WaitForChild("Remotes")
+
+local EquipPickaxe = Remotes.EquipPickaxe
+local oreEvent = Remotes.OreEvent
+local isOverweight = RS:WaitForChild("Remotes"):WaitForChild("CheckWeightLimit")
+local Explosion = SS.VFX:WaitForChild("Explosion")
+local HitSound = SS.Sounds:WaitForChild("Hit")
+local BreakSound = SS.Sounds:WaitForChild("Break")
+
+local module = {}
+
+function module.MineRock(player, rock, oreType, miningFortune)
+	-- Validate
+	if not player or not rock then
+		return
+	end
+	oreType = oreType or OreUtils.getOreType(rock)
+	if not oreType then
+		return
+	end
+
+
+	-- Pickaxe durability check
+	local pickaxeInstanceId = (function()
+		if not player or not player.Character then
+			return nil
+		end
+		local equippedTool = player.Character:FindFirstChildOfClass("Tool")
+		if equippedTool and equippedTool:GetAttribute("ItemType") == "Pickaxe" then
+			return equippedTool:GetAttribute("PickaxeInstanceId")
+		end
+		return nil
+	end)()
+	if not pickaxeInstanceId or not PlayerDataManager.HasDurability(player, pickaxeInstanceId) then
+		if RS.Remotes:FindFirstChild("PickaxeBroken") then
+			RS.Remotes.PickaxeBroken:FireClient(player, pickaxeInstanceId)
+		end
+		return
+	end
+
+	-- Decrease durability
+	PlayerDataManager.UpdatePickaxeDurability(player, pickaxeInstanceId, -1)
+
+	local breakingPower = StatsManager:GetPlayerStat(player, "TotalBreakingPower")
+	local oreData = require(RS.Templates.OreTemplate)[oreType]
+	if oreData.BreakingPowerRequirement and breakingPower < oreData.BreakingPowerRequirement then
+		return
+	end
+
+	-- Stats
+	local playerMiningFortune = miningFortune or StatsManager:GetPlayerStat(player, "TotalMiningFortune")
+	local hasBonus, bonus = pcall(function()
+		return PlayerDataManager.GetCollectionFortuneBonus(player, oreType)
+	end)
+	if hasBonus and type(bonus) == "number" and bonus > 0 then
+		playerMiningFortune = playerMiningFortune * (1 + bonus)
+	end
+	-- Hitpoints logic
+	local currentHitpoints = rock:GetAttribute("CurrentHitpoints")
+	local maxHitpoints = rock:GetAttribute("MaxHitpoints")
+	local variantType = rock:GetAttribute("VariantType")
+	if not currentHitpoints or not variantType then
+		variantType = OreVariantManager.initializeOreWithVariant(rock, oreType)
+		currentHitpoints = rock:GetAttribute("CurrentHitpoints")
+		maxHitpoints = rock:GetAttribute("MaxHitpoints")
+	end
+
+	if RS.Remotes:FindFirstChild("UpdateMiningTimer") then
+		RS.Remotes.UpdateMiningTimer:FireClient(player, oreType, currentHitpoints, maxHitpoints, variantType)
+	end
+
+	currentHitpoints = currentHitpoints - 1
+
+	rock:SetAttribute("CurrentHitpoints", math.max(0, currentHitpoints))
+	if rock:IsA("Model") then
+		for _, child in pairs(rock:GetDescendants()) do
+			if child:IsA("BasePart") then
+				child:SetAttribute("CurrentHitpoints", math.max(0, currentHitpoints))
+			end
+		end
+	end
+
+	local function shakeRock(rock)
+		local rootPart = rock:IsA("Model") and rock:FindFirstChild("PrimaryPart") or rock
+		if not rootPart then return end
+
+		-- Ensure PrimaryPart is set for models
+		if rock:IsA("Model") and not rock.PrimaryPart then
+			for _, part in ipairs(rock:GetDescendants()) do
+				if part:IsA("BasePart") then
+					rock.PrimaryPart = part
+					break
+				end
+			end
+			rootPart = rock.PrimaryPart
+		end
+
+		if not rootPart then return end
+
+		local originalCFrame = rootPart.CFrame
+		local offset = Vector3.new(0.3, 0, 0) -- small side shake
+		local shakeCFrame = originalCFrame * CFrame.new(offset)
+
+		-- Tween shake
+		local tweenInfo = TweenInfo.new(0.05, Enum.EasingStyle.Quad, Enum.EasingDirection.Out, 0, true) -- repeat once, yoyo
+		local tween = TweenService:Create(rootPart, tweenInfo, {CFrame = shakeCFrame})
+		tween:Play()
+	end
+
+	shakeRock(rock)
+	HitSound:Play()
+
+	local variantData = OreDropManager.getVariantData(rock, oreType)
+	local baseYield = variantData.BaseYield
+	local fortuneMultiplier = OreDropManager.calculateFortuneMultiplier(playerMiningFortune)
+	local miningPosition = OreUtils.getCenterPosition(rock)
+	local drops = OreDropManager.GetDrops(oreType, fortuneMultiplier, baseYield, variantType)
+
+	-- Generate weight data for this mining instance
+	local weightData = OreDropManager.randomizedWeight(rock, oreType)
+	local dropWeight = weightData and weightData.TotalWeight or 1
+
+	dropWeight = math.floor(dropWeight + 0.5)
+
+	for _, dropData in ipairs(drops) do
+		local baseName = dropData.name
+		local finalQuantity = math.ceil(dropData.data.Quantity)
+
+		-- Track in cave session (temporary record)
+		PlayerDataManager.TrackCaveLoot(player, "ore", { name = baseName, amount = finalQuantity })
+
+		-- Fake item for backpack UI
+		local fakeOre = Instance.new("Tool")
+		fakeOre.Name = baseName
+		fakeOre.RequiresHandle = false
+		fakeOre:SetAttribute("Temporary", true) -- ✅ mark as temporary
+		fakeOre:SetAttribute("OreName", baseName)
+		fakeOre:SetAttribute("Amount", finalQuantity)
+		fakeOre.Parent = player.Backpack
+
+		PlayerDataManager.AddToCollection(player, baseName, finalQuantity)
+		if _G.AchievementSystem then
+			_G.AchievementSystem.OnCollectionUpdated(player, baseName, finalQuantity)
+		end
+	end
+
+	oreEvent:FireClient(player, drops, miningPosition)
+
+	if currentHitpoints <= 0 then
+		if oreData then
+			local baseAmount = oreData.Variants and oreData.Variants[variantType].OreAmount or oreData.OreAmount or 1
+			local dropAmount = math.floor(baseAmount * (1 + (playerMiningFortune / 100)))
+
+			-- Generate separate weight data for the main ore drop when rock breaks
+			local mainOreWeightData = OreDropManager.randomizedWeight(rock, oreType)
+			local mainOreWeight = mainOreWeightData and mainOreWeightData.TotalWeight or 1
+
+
+			mainOreWeight = math.floor(mainOreWeight + 0.5)
+			PlayerDataManager.TrackCaveLoot(player, "ore", { name = oreType, amount = dropAmount })
+			PlayerDataManager.AddOre(player, oreType, dropAmount, mainOreWeight)
+			PlayerDataManager.AddToCollection(player, oreType, dropAmount)
+			if _G.AchievementSystem and _G.AchievementSystem.OnCollectionUpdated then
+				_G.AchievementSystem.OnCollectionUpdated(player, oreType, dropAmount)
+			end
+		end
+		BreakEffectManager.BreakRock(rock, Explosion, BreakSound, SS)
+	else
+		local healthPercent = currentHitpoints / maxHitpoints
+		if rock:IsA("Model") then
+			for _, child in pairs(rock:GetChildren()) do
+				if child:IsA("BasePart") then
+					OreDecalManager.updateRockBreaking(child, healthPercent)
+				end
+			end
+		else
+			OreDecalManager.updateRockBreaking(rock, healthPercent)
+		end
+		rock:SetAttribute("LastHealthPercent", healthPercent)
+		rock:SetAttribute("LastBreakingUpdate", tick())
+		if RS.Remotes:FindFirstChild("UpdateMiningTimer") then
+			RS.Remotes.UpdateMiningTimer:FireClient(player, oreType, currentHitpoints, maxHitpoints, variantType)
+		end
+	end
+end
+
+local function onEquipPickaxe(player, pickaxeId, modifierId, isEquipping)
+	local pickaxeStats = {}
+
+	if isEquipping then
+		local pickaxeData = PickaxeTemplate[pickaxeId]
+		if not pickaxeData then
+			warn("Invalid pickaxeId:", pickaxeId)
+			return
+		end
+
+		local modifierData = ModifierTemplate[modifierId] or {}
+
+		for _, statName in ipairs(StatsConfig.DirectStats) do
+			local pickaxeStatValue = pickaxeData[statName] or 0
+			local modifierStatValue = modifierData[statName] or 0
+
+			-- Only add the stat to the table if it has a non-zero value
+			local totalValue = pickaxeStatValue + modifierStatValue
+			if totalValue ~= 0 then
+				pickaxeStats[statName] = totalValue
+			end
+		end
+	end
+	-- If not equipping, pickaxeStats remains an empty table, which correctly sets all pickaxe stats to 0.
+
+	StatsManager:UpdateSourceStats(player, "Pickaxe", pickaxeStats)
+end
+
+EquipPickaxe.OnServerEvent:Connect(onEquipPickaxe)
+
+return module
+
+-- CaveLootTracker (ModuleScript in DataManagerModules)
+local CaveLootTracker = {}
+CaveLootTracker.__index = CaveLootTracker
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ServerScriptService = game:GetService("ServerScriptService")
+
+-- Local references to existing managers
+local OrthCurrencyManager, OreCore, ToolManager, PlayerInventoryManager, RelicCore, PetManager
+
+
+
+function CaveLootTracker:Init(dataManager)
+	-- Get references to existing managers
+	OrthCurrencyManager = dataManager.OrthCurrencyManager
+	OreCore = dataManager.OreCore
+	ToolManager = dataManager.ToolManager
+	PlayerInventoryManager = dataManager.PlayerInventoryManager
+	RelicCore = dataManager.RelicCore
+	PetManager = dataManager.PetManager
+	PlayerDataManager = dataManager -- ✅ store reference
+
+	-- Set up remote events
+	self.ShowCaveResultsEvent = Instance.new("RemoteEvent")
+	self.ShowCaveResultsEvent.Name = "ShowCaveResultsEvent"
+	self.ShowCaveResultsEvent.Parent = ReplicatedStorage
+
+	self.CaveLootUpdateEvent = Instance.new("RemoteEvent")
+	self.CaveLootUpdateEvent.Name = "CaveLootUpdateEvent"
+	self.CaveLootUpdateEvent.Parent = ReplicatedStorage
+end
+
+-- Track temporary loot during cave sessions
+local caveSessions = {}
+
+function CaveLootTracker:StartCaveSession(player)
+	local userId = player.UserId
+	caveSessions[userId] = {
+		startTime = os.time(),
+		temporaryLoot = {
+			currency = 0,
+			ores = {},
+			tools = {},
+			artifacts = {},
+			pets = {}
+		}
+	}
+end
+
+function CaveLootTracker:TrackTemporaryLoot(player, itemType, itemData)
+	local userId = player.UserId
+	if not caveSessions[userId] then return end
+
+	local session = caveSessions[userId]
+
+	if itemType == "currency" then
+		session.temporaryLoot.currency = (session.temporaryLoot.currency or 0) + (itemData.amount or 0)
+
+	elseif itemType == "ore" then
+		local oreName = itemData.name
+		local amount = itemData.amount or 0
+		local weight = itemData.weight or 0
+
+		-- Store both amount and weight (weight useful for RemoveOre later)
+		if not session.temporaryLoot.ores[oreName] then
+			session.temporaryLoot.ores[oreName] = {amount = 0, weight = weight}
+		end
+		session.temporaryLoot.ores[oreName].amount += amount
+		-- overwrite weight if provided (keeps latest seen)
+		if weight > 0 then
+			session.temporaryLoot.ores[oreName].weight = weight
+		end
+
+	elseif itemType == "tool" then
+		-- Expecting itemData like {id = instanceId, templateId = 3}
+		if itemData.id or itemData.templateId then
+			table.insert(session.temporaryLoot.tools, {
+				id = itemData.id,
+				templateId = itemData.templateId
+			})
+		end
+
+	elseif itemType == "artifact" then
+		-- Expecting {instanceId = "...", templateId = ...}
+		if itemData.instanceId then
+			table.insert(session.temporaryLoot.artifacts, {
+				instanceId = itemData.instanceId,
+				templateId = itemData.templateId
+			})
+		end
+
+	elseif itemType == "pet" then
+		-- Expecting {instanceId = "...", petId = ...}
+		if itemData.instanceId then
+			table.insert(session.temporaryLoot.pets, {
+				instanceId = itemData.instanceId,
+				petId = itemData.petId
+			})
+		end
+	end
+
+	-- Update client UI with temporary loot
+	self.CaveLootUpdateEvent:FireClient(player, session.temporaryLoot)
+end
+
+
+function CaveLootTracker:HandleSafeExit(player)
+	local userId = player.UserId
+	if not caveSessions[userId] then return end
+
+	local sessionData = caveSessions[userId]
+	local sessionTime = os.time() - sessionData.startTime
+
+	-- Add ALL temporary loot to permanent inventory
+	self:AddLootToPermanentInventory(player, sessionData.temporaryLoot)
+
+	-- Show success results
+	self:ShowResults(player, {
+		success = true,
+		sessionTime = sessionTime,
+		acquiredLoot = sessionData.temporaryLoot,
+		penaltyApplied = false,
+		lostLoot = {}
+	})
+
+	caveSessions[userId] = nil
+end
+
+function CaveLootTracker:HandleDeath(player)
+	local userId = player.UserId
+	if not caveSessions[userId] then return end
+
+	local sessionData = caveSessions[userId]
+	local sessionTime = os.time() - sessionData.startTime
+
+	-- Apply penalty and get what they actually keep
+	local keptLoot, lostLoot = self:ApplyPenalty(sessionData.temporaryLoot, 60)
+
+	-- Add only the kept loot to permanent inventory
+	self:AddLootToPermanentInventory(player, keptLoot)
+
+	-- Remove lost tools (assuming lostLoot.tools contains tables with an 'id' field for instance id)
+	for _, toolData in ipairs(lostLoot.tools or {}) do
+		local instanceId = toolData.id or toolData.instanceId
+		if instanceId then
+			pcall(function()
+				PlayerDataManager.RemovePickaxe(player, instanceId)
+			end)
+		else
+			-- fallback: remove by template id if that is what you tracked
+			if toolData.templateId then
+				-- Implement a function that removes one tool by templateId from inventory:
+				PlayerDataManager.RemoveToolByTemplate(player, toolData.templateId)
+			end
+		end
+	end
+
+	-- Artifacts and pets: similar approach using RemoveArtifact / RemovePet APIs
+	for _, artifactData in ipairs(lostLoot.artifacts or {}) do
+		if artifactData.instanceId then
+			pcall(function()
+				PlayerDataManager.RemoveArtifact(player, artifactData.instanceId)
+			end)
+		end
+	end
+
+	for _, petData in ipairs(lostLoot.pets or {}) do
+		if petData.instanceId then
+			pcall(function()
+				PlayerDataManager.RemovePet(player, petData.instanceId)
+			end)
+		end
+	end
+
+
+	-- Add only the kept loot to permanent inventory
+	self:AddLootToPermanentInventory(player, keptLoot)
+
+	-- Show results with penalty information
+	self:ShowResults(player, {
+		success = false,
+		sessionTime = sessionTime,
+		acquiredLoot = sessionData.temporaryLoot,
+		keptLoot = keptLoot,
+		lostLoot = lostLoot,
+		penaltyApplied = true,
+		penaltyPercent = 70
+	})
+
+	caveSessions[userId] = nil
+end
+
+function CaveLootTracker:ApplyPenalty(temporaryLoot, percent)
+	local keepFraction = (100 - percent) / 100
+	local keptLoot = {currency = 0, ores = {}, tools = {}, artifacts = {}, pets = {}}
+	local lostLoot = {currency = 0, ores = {}, tools = {}, artifacts = {}, pets = {}}
+
+	-- Currency
+	keptLoot.currency = math.floor(temporaryLoot.currency * keepFraction)
+	lostLoot.currency = temporaryLoot.currency - keptLoot.currency
+
+	-- Ores
+	for oreName, oreData in pairs(temporaryLoot.ores) do
+		local totalAmount = oreData.amount or 0
+		local weight = oreData.weight or 1
+
+		local keptAmount = math.floor(totalAmount * keepFraction)
+		local lostAmount = totalAmount - keptAmount
+
+		keptLoot.ores[oreName] = {amount = keptAmount, weight = weight}
+		lostLoot.ores[oreName] = {amount = lostAmount, weight = weight}
+	end
+
+
+	-- Unique items (tools, artifacts, pets)
+	local uniqueItems = {}
+	for _, item in ipairs(temporaryLoot.tools) do table.insert(uniqueItems, {type = "tool", data = item}) end
+	for _, item in ipairs(temporaryLoot.artifacts) do table.insert(uniqueItems, {type = "artifact", data = item}) end
+	for _, item in ipairs(temporaryLoot.pets) do table.insert(uniqueItems, {type = "pet", data = item}) end
+
+	-- Shuffle and keep fraction
+	local shuffled = self:ShuffleArray(uniqueItems)
+	local keepCount = math.floor(#shuffled * keepFraction)
+
+	for i, item in ipairs(shuffled) do
+		if i <= keepCount then
+			table.insert(keptLoot[item.type .. "s"], item.data)
+		else
+			table.insert(lostLoot[item.type .. "s"], item.data)
+		end
+	end
+
+	return keptLoot, lostLoot
+end
+
+function CaveLootTracker:AddLootToPermanentInventory(player, loot)
+	-- Add currency
+	if loot.currency > 0 then
+		OrthCurrencyManager.AddOrth(player, loot.currency)
+	end
+
+	-- Remove all temporary ores
+	for _, item in ipairs(player.Backpack:GetChildren()) do
+		if item:GetAttribute("Temporary") and item:GetAttribute("OreName") then
+			item:Destroy()
+		end
+	end
+
+	-- Now add permanent ores
+	for oreName, oreData in pairs(loot.ores or {}) do
+		local amount = oreData.amount or 0
+		if amount > 0 then
+			OreCore.AddOre(player, oreName, amount, oreData.weight or 1)
+		end
+	end
+
+	-- Add tools
+	for _, toolData in ipairs(loot.tools) do
+		ToolManager.AddPickaxe(player, toolData.id, toolData.modifierId)
+	end
+
+	-- Add artifacts
+	for _, artifactData in ipairs(loot.artifacts) do
+		RelicCore.AddArtifact(player, artifactData.id, artifactData.tier, artifactData.level)
+	end
+
+	-- Add pets
+	for _, petData in ipairs(loot.pets) do
+		PetManager.AddPet(player, petData.id)
+	end
+end
+
+function CaveLootTracker:HandlePrematureExit(player)
+	local userId = player.UserId
+	if not caveSessions[userId] then return end
+
+	local sessionData = caveSessions[userId]
+	local sessionTime = os.time() - sessionData.startTime
+
+	-- Apply 70% penalty (so only keep 30%)
+	local keptLoot, lostLoot = self:ApplyPenalty(sessionData.temporaryLoot, 70)
+
+	-- Add only the kept loot to permanent inventory
+	self:AddLootToPermanentInventory(player, keptLoot)
+
+	-- Remove lost tools (assuming lostLoot.tools contains tables with an 'id' field for instance id)
+	for _, toolData in ipairs(lostLoot.tools or {}) do
+		local instanceId = toolData.id or toolData.instanceId
+		if instanceId then
+			pcall(function()
+				PlayerDataManager.RemovePickaxe(player, instanceId)
+			end)
+		else
+			-- fallback: remove by template id if that is what you tracked
+			if toolData.templateId then
+				-- Implement a function that removes one tool by templateId from inventory:
+				PlayerDataManager.RemoveToolByTemplate(player, toolData.templateId)
+			end
+		end
+	end
+
+	-- Artifacts and pets: similar approach using RemoveArtifact / RemovePet APIs
+	for _, artifactData in ipairs(lostLoot.artifacts or {}) do
+		if artifactData.instanceId then
+			pcall(function()
+				PlayerDataManager.RemoveArtifact(player, artifactData.instanceId)
+			end)
+		end
+	end
+
+	for _, petData in ipairs(lostLoot.pets or {}) do
+		if petData.instanceId then
+			pcall(function()
+				PlayerDataManager.RemovePet(player, petData.instanceId)
+			end)
+		end
+	end
+
+	-- Add only the kept loot
+	self:AddLootToPermanentInventory(player, keptLoot)
+
+	-- Show results
+	self:ShowResults(player, {
+		success = false,
+		sessionTime = sessionTime,
+		acquiredLoot = sessionData.temporaryLoot,
+		keptLoot = keptLoot,   -- ✅ send to client
+		lostLoot = lostLoot,   -- ✅ send to client
+		penaltyApplied = true,
+		penaltyPercent = 70
+	})
+
+	caveSessions[userId] = nil
+end
+
+
+function CaveLootTracker:ShuffleArray(array)
+	local shuffled = {}
+	for i = 1, #array do shuffled[i] = array[i] end
+	for i = #shuffled, 2, -1 do
+		local j = math.random(i)
+		shuffled[i], shuffled[j] = shuffled[j], shuffled[i]
+	end
+	return shuffled
+end
+
+function CaveLootTracker:ShowResults(player, results)
+	self.ShowCaveResultsEvent:FireClient(player, results)
+end
+
+return CaveLootTracker
+
+-- OreCore Module (Refactored & Shuffled)
+local OreCore = {}
+
+-- Dependencies
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ServerScriptService = game:GetService("ServerScriptService")
+local Remotes = ReplicatedStorage:WaitForChild("RS"):WaitForChild("Remotes")
+local DataManagerModules = ServerScriptService:WaitForChild("SSS"):WaitForChild("Data"):WaitForChild("DataManagerModules")
+local ToolsUtils = require(DataManagerModules.ToolsUtils)
+
+-- External reference (set by PlayerDataManager)
+local PlayerDataManager = nil
+
+-- Set PlayerDataManager reference (to avoid circular dependency)
+function OreCore.SetDataManager(ref)
+	PlayerDataManager = ref
+end
+
+-- Utility: Get ore template data
+local function fetchOreTemplate(oreName)
+	local ok, oreData = pcall(function()
+		local RS = game:GetService("ReplicatedStorage"):WaitForChild("RS")
+		local Templates = RS:WaitForChild("Templates")
+		local OreTemplate = require(Templates.OreTemplate)
+		return OreTemplate[oreName]
+	end)
+	if ok and oreData then
+		return oreData
+	end
+	return { Value = 10, weight = 1 }
+end
+
+-- Utility: Update ore tool in backpack
+local function updateOreTool(player, oreName, weight)
+	if not PlayerDataManager then return end
+	local profile = PlayerDataManager.Profiles[player]
+	if not profile then return end
+	local backpack = player:FindFirstChild("Backpack")
+	local character = player.Character
+	if not backpack then return end
+
+	local foundTool
+	for _, tool in ipairs(backpack:GetChildren()) do
+		if tool:IsA("Tool") and tool:GetAttribute("ItemType") == "Ore"
+			and tool:GetAttribute("ItemName") == oreName
+			and tool:GetAttribute("Weight") == weight then
+			foundTool = tool
+			break
+		end
+	end
+	if not foundTool and character then
+		local equipped = character:FindFirstChildOfClass("Tool")
+		if equipped and equipped:GetAttribute("ItemType") == "Ore"
+			and equipped:GetAttribute("ItemName") == oreName
+			and equipped:GetAttribute("Weight") == weight then
+			foundTool = equipped
+		end
+	end
+
+	local oreInventory = profile.Data.Inventory.Ores
+	local weightStr = tostring(weight)
+	local qty = 0
+	if oreInventory and oreInventory[oreName] and oreInventory[oreName].weights then
+		qty = oreInventory[oreName].weights[weightStr] or 0
+	end
+
+	if qty > 0 then
+		local displayWeight = weight == math.floor(weight) and tostring(weight) or string.format("%.1f", weight)
+		local newName = oreName .. " " .. displayWeight .. "kg (" .. qty .. ")"
+		if foundTool then
+			foundTool.Name = newName
+			foundTool:SetAttribute("Quantity", qty)
+		else
+			local newTool = ToolsUtils.CreateOreToolInstance(oreName, qty, weight)
+			if newTool then
+				newTool.Parent = backpack
+			end
+		end
+	else
+		if foundTool then
+			foundTool:Destroy()
+		end
+	end
+end
+
+-- Inventory migration: Decimal weights to integer weights
+function OreCore.MigrateDecimalWeights(player)
+	if not PlayerDataManager then return end
+	local profile = PlayerDataManager.Profiles[player]
+	if not profile or not profile.Data.Inventory or not profile.Data.Inventory.Ores then return end
+	for oreName, oreEntry in pairs(profile.Data.Inventory.Ores) do
+		if type(oreEntry) == "table" and type(oreEntry.weights) == "table" then
+			local newWeights = {}
+			for wStr, amt in pairs(oreEntry.weights) do
+				local wNum = tonumber(wStr)
+				if wNum then
+					local rounded = math.floor(wNum + 0.5)
+					local roundedStr = tostring(rounded)
+					newWeights[roundedStr] = (newWeights[roundedStr] or 0) + amt
+				end
+			end
+			oreEntry.weights = newWeights
+		end
+	end
+end
+
+-- Get player's ore inventory
+function OreCore.GetOreInventory(player)
+	if not PlayerDataManager then return {} end
+	local profile = PlayerDataManager.Profiles[player]
+	if not profile then return {} end
+	if not profile.Data.Inventory then
+		if PlayerDataManager.InitializeInventory then
+			PlayerDataManager.InitializeInventory(profile.Data)
+		end
+	end
+	return profile.Data.Inventory.Ores
+end
+
+-- Get specific ore amount
+function OreCore.GetOreAmount(player, oreName)
+	if not PlayerDataManager then return 0 end
+	local profile = PlayerDataManager.Profiles[player]
+	if not profile then return 0 end
+	if not profile.Data.Inventory then
+		if PlayerDataManager.InitializeInventory then
+			PlayerDataManager.InitializeInventory(profile.Data)
+		end
+	end
+	local oreData = profile.Data.Inventory.Ores[oreName]
+	if not oreData then return 0 end
+	if type(oreData) == "table" and oreData.weights then
+		local total = 0
+		for _, amt in pairs(oreData.weights) do
+			total = total + amt
+		end
+		return total
+	else
+		return oreData or 0
+	end
+end
+
+-- Add ore to player's inventory
+function OreCore.AddOre(player, oreName, amount, weight)
+	if not PlayerDataManager then return false, "System error" end
+	local profile = PlayerDataManager.Profiles[player]
+	if not profile then return false, "No profile found" end
+	weight = weight or 1
+	if PlayerDataManager.PlayerInventoryManager and PlayerDataManager.CanCollectOre then
+		if not PlayerDataManager.CanCollectOre(player, oreName, amount, weight) then
+			return false, "Inventory full - upgrade your ore bag!"
+		end
+	end
+	if not profile.Data.Inventory then
+		if PlayerDataManager.InitializeInventory then
+			PlayerDataManager.InitializeInventory(profile.Data)
+		end
+	end
+	if not profile.Data.Inventory.Ores[oreName] or type(profile.Data.Inventory.Ores[oreName]) ~= "table" then
+		profile.Data.Inventory.Ores[oreName] = { weights = {} }
+	end
+	if not profile.Data.Inventory.Ores[oreName].weights then
+		profile.Data.Inventory.Ores[oreName].weights = {}
+	end
+	local weightStr = tostring(weight)
+	if not profile.Data.Inventory.Ores[oreName].weights[weightStr] then
+		profile.Data.Inventory.Ores[oreName].weights[weightStr] = 0
+	end
+	profile.Data.Inventory.Ores[oreName].weights[weightStr] += amount
+	updateOreTool(player, oreName, weight)
+	if PlayerDataManager.GetEquippedPet and PlayerDataManager.AddPetXP then
+		local petId = PlayerDataManager.GetEquippedPet(player)
+		if petId then
+			PlayerDataManager.AddPetXP(player, petId, amount)
+		end
+	end
+	if Remotes:FindFirstChild("UpdateOreInventory") then
+		Remotes.UpdateOreInventory:FireClient(player, profile.Data.Inventory.Ores)
+	end
+	if Remotes:FindFirstChild("OreAdded") then
+		Remotes.OreAdded:FireClient(player, oreName, amount, weight, profile.Data.Inventory.Ores[oreName].weights[weightStr])
+	end
+	if Remotes:FindFirstChild("UpdateWeight") then
+		local weightInfo = PlayerDataManager.PlayerInventoryManager.GetWeightInfo(player)
+		Remotes.UpdateWeight:FireClient(player, weightInfo)
+	end
+	OreCore.CheckAndNotifyOverweightStatus(player)
+	return true, "Ore added successfully"
+end
+
+-- Remove ore from player's inventory
+function OreCore.RemoveOre(player, oreName, amount, weight)
+	if not PlayerDataManager then return false end
+	local profile = PlayerDataManager.Profiles[player]
+	if not profile or not profile.Data.Inventory or not profile.Data.Inventory.Ores then return false end
+	local oreData = profile.Data.Inventory.Ores[oreName]
+	if not oreData then return false end
+	if type(oreData) == "table" and oreData.weights then
+		if weight then
+			local weightStr = tostring(weight)
+			if not oreData.weights[weightStr] then return false end
+			if oreData.weights[weightStr] < amount then return false end
+			oreData.weights[weightStr] = oreData.weights[weightStr] - amount
+			if oreData.weights[weightStr] <= 0 then
+				oreData.weights[weightStr] = nil
+			end
+		else
+			local toRemove = amount
+			local weights = oreData.weights
+			local sorted = {}
+			for wStr, amt in pairs(weights) do
+				table.insert(sorted, { weight = tonumber(wStr), amount = amt })
+			end
+			table.sort(sorted, function(a, b) return a.weight < b.weight end)
+			local i = 1
+			while toRemove > 0 and i <= #sorted do
+				local wData = sorted[i]
+				local wStr = tostring(wData.weight)
+				if wData.amount <= toRemove then
+					toRemove = toRemove - wData.amount
+					weights[wStr] = nil
+					i = i + 1
+				else
+					weights[wStr] = wData.amount - toRemove
+					toRemove = 0
+				end
+			end
+			if toRemove > 0 then return false end
+		end
+	else
+		if (oreData or 0) < amount then return false end
+		profile.Data.Inventory.Ores[oreName] = oreData - amount
+		if profile.Data.Inventory.Ores[oreName] <= 0 then
+			profile.Data.Inventory.Ores[oreName] = nil
+		end
+	end
+	if Remotes:FindFirstChild("UpdateOreInventory") then
+		Remotes.UpdateOreInventory:FireClient(player, profile.Data.Inventory.Ores)
+	end
+	OreCore.CheckAndNotifyOverweightStatus(player)
+	return true
+end
+
+-- Set specific ore amount
+function OreCore.SetOreAmount(player, oreName, amount)
+	if not PlayerDataManager then return false end
+	local profile = PlayerDataManager.Profiles[player]
+	if not profile then return false end
+	if not profile.Data.Inventory then
+		if PlayerDataManager.InitializeInventory then
+			PlayerDataManager.InitializeInventory(profile.Data)
+		end
+	end
+	if amount <= 0 then
+		profile.Data.Inventory.Ores[oreName] = nil
+	else
+		profile.Data.Inventory.Ores[oreName] = amount
+	end
+	if Remotes:FindFirstChild("UpdateOreInventory") then
+		Remotes.UpdateOreInventory:FireClient(player, profile.Data.Inventory.Ores)
+	end
+	OreCore.CheckAndNotifyOverweightStatus(player)
+	return true
+end
+
+-- Check if player has enough of a specific ore
+function OreCore.HasEnoughOre(player, oreName, requiredAmount)
+	return OreCore.GetOreAmount(player, oreName) >= requiredAmount
+end
+
+-- Get total count of all ores
+function OreCore.GetTotalOreCount(player)
+	local oreInventory = OreCore.GetOreInventory(player)
+	local total = 0
+	for oreName, oreData in pairs(oreInventory) do
+		if type(oreData) == "table" and oreData.weights then
+			for _, amt in pairs(oreData.weights) do
+				total = total + amt
+			end
+		else
+			total = total + (oreData or 0)
+		end
+	end
+	return total
+end
+
+-- Get total weight of all ores
+function OreCore.GetTotalOreWeight(player)
+	local oreInventory = OreCore.GetOreInventory(player)
+	local totalWeight = 0
+	for oreName, oreData in pairs(oreInventory) do
+		if type(oreData) == "table" and oreData.weights then
+			for wStr, qty in pairs(oreData.weights) do
+				local wNum = tonumber(wStr)
+				if wNum and qty > 0 then
+					totalWeight = totalWeight + (wNum * qty)
+				end
+			end
+		else
+			local qty = oreData or 0
+			if qty > 0 then
+				local oreTemplate = fetchOreTemplate(oreName)
+				local w = oreTemplate.weight or 1
+				totalWeight = totalWeight + (w * qty)
+			end
+		end
+	end
+	return totalWeight
+end
+
+-- Would adding ore exceed max weight?
+function OreCore.WouldExceedMaxWeight(player, oreName, quantity, weight, maxWeight)
+	local currentWeight = OreCore.GetTotalOreWeight(player)
+	local addWeight = (weight or 1) * quantity
+	return (currentWeight + addWeight) > maxWeight
+end
+
+-- Is player at or over max weight?
+function OreCore.IsOverMaxWeight(player, maxWeight)
+	local currentWeight = OreCore.GetTotalOreWeight(player)
+	return currentWeight >= maxWeight
+end
+
+-- Notify overweight status to client
+function OreCore.CheckAndNotifyOverweightStatus(player)
+	if not PlayerDataManager then return end
+	local weightInfo = PlayerDataManager.GetWeightInfo(player)
+	local currentWeight = weightInfo.current or 0
+	local maxWeight = weightInfo.max or 0
+	local isOverweight = false
+	if maxWeight > 0 then
+		isOverweight = currentWeight >= maxWeight
+	elseif currentWeight > 0 and maxWeight == 0 then
+		isOverweight = false
+	end
+	if Remotes:FindFirstChild("WeightStatusChanged") then
+		Remotes.WeightStatusChanged:FireClient(player, isOverweight)
+	end
+	if Remotes:FindFirstChild("UpdateOverweightStatus") then
+		Remotes.UpdateOverweightStatus:FireClient(player, isOverweight, currentWeight, maxWeight)
+	end
+end
+
+-- Update ore inventory and notify client
+function OreCore.UpdateOreInventory(player, newOreInventory)
+	if not PlayerDataManager then return end
+	local profile = PlayerDataManager.Profiles[player]
+	if not profile then return end
+	profile.Data.Inventory.Ores = newOreInventory
+	if Remotes:FindFirstChild("UpdateOreInventory") then
+		Remotes.UpdateOreInventory:FireClient(player, newOreInventory)
+	end
+	OreCore.CheckAndNotifyOverweightStatus(player)
+end
+
+-- Refresh all ore tools in player's backpack
+function OreCore.RefreshAllOreTools(player)
+	if not PlayerDataManager then return end
+	local profile = PlayerDataManager.Profiles[player]
+	if not profile or not profile.Data.Inventory or not profile.Data.Inventory.Ores then return end
+	local backpack = player:FindFirstChild("Backpack")
+	if backpack then
+		for _, tool in ipairs(backpack:GetChildren()) do
+			if tool:IsA("Tool") and tool:GetAttribute("ItemType") == "Ore" then
+				tool:Destroy()
+			end
+		end
+	end
+	for oreName, oreData in pairs(profile.Data.Inventory.Ores) do
+		if oreData.weights then
+			for wStr, qty in pairs(oreData.weights) do
+				if qty > 0 then
+					local wNum = tonumber(wStr)
+					updateOreTool(player, oreName, wNum)
+				end
+			end
+		end
+	end
+end
+
+return OreCore
+
+-- Data Manager Module (Refactored)
+
+local PlayerDataManager = {}
+-- Store Profiles from ProfileStore
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ServerScriptService = game:GetService("ServerScriptService")
+local DataStoreService = game:GetService("DataStoreService")
+local Remotes = ReplicatedStorage:WaitForChild("RS"):WaitForChild("Remotes")
+local StatsManager = require(ServerScriptService.SSS.Server.StatsCore)
+local Players = game:GetService("Players")
+local ServerStorage = game:GetService("ServerStorage")
+local DropsTemplate = require(ReplicatedStorage.RS.Templates.DropsTemplate)
+local CaveLootTracker = require(ServerScriptService.SSS.Data.DataManagerModules.CaveLootTracker)
+
+local DataManagerModules = ServerScriptService:WaitForChild("SSS"):WaitForChild("Data"):WaitForChild("DataManagerModules")
+
+-- Core managers
+local OrthCurrencyManager = require(DataManagerModules.OrthCurrencyManager)
+local OreCore = require(DataManagerModules.OreCore)
+local SmeltingManager = require(DataManagerModules.SmeltingManager)
+local ToolManager = require(DataManagerModules.ToolManager)
+local PlayerInventoryManager = require(DataManagerModules.PlayerInventoryManager)
+local OreCollectionTracker = require(DataManagerModules.OreCollectionTracker)
+local PlaytimeManager = require(DataManagerModules.PlaytimeManager)
+local PetManager = require(DataManagerModules.PetManager)
+local PetEggManager = require(DataManagerModules.PetEggManager)
+local ShopManager = require(DataManagerModules.ShopManager)
+local RecipeManager = require(DataManagerModules.RecipeManager)
+local LayerManager = require(DataManagerModules.LayerManager)
+local PremiumEterniumManager = require(DataManagerModules.PremiumEterniumManager)
+local RelicCore = require(DataManagerModules.RelicCore)
+local LootRollManager = require(DataManagerModules.LootRollManager)
+
+-- Set up circular dependency references
+OrthCurrencyManager.SetDataManager(PlayerDataManager)
+OreCore.SetDataManager(PlayerDataManager)
+ToolManager.SetDataManager(PlayerDataManager)
+PlayerInventoryManager.SetDataManager(PlayerDataManager)
+OreCollectionTracker.SetDataManager(PlayerDataManager)
+PlaytimeManager.SetDataManager(PlayerDataManager)
+PetManager.SetDataManager(PlayerDataManager)
+PetEggManager.SetDataManager(PlayerDataManager)
+ShopManager.SetDataManager(PlayerDataManager)
+RecipeManager.SetDataManager(PlayerDataManager)
+SmeltingManager.SetDataManager(PlayerDataManager)
+LayerManager.SetDataManager(PlayerDataManager)
+PremiumEterniumManager.SetDataManager(PlayerDataManager)
+RelicCore.SetDataManager(PlayerDataManager)
+LootRollManager.SetDataManager(PlayerDataManager)
+
+-- Exposed API
+
+PlayerDataManager.OrthCurrencyManager = OrthCurrencyManager
+PlayerDataManager.OreCore = OreCore
+PlayerDataManager.ToolManager = ToolManager
+PlayerDataManager.PlayerInventoryManager = PlayerInventoryManager
+PlayerDataManager.RelicCore = RelicCore
+PlayerDataManager.PetManager = PetManager
+
+PlayerDataManager.Profiles = {}
+local loadedPlayers = {}
+
+function PlayerDataManager.MarkDataReady(player)
+	loadedPlayers[player] = true
+end
+
+function PlayerDataManager.IsDataReady(player)
+	return loadedPlayers[player] == true
+end
+
+-- =======================================================================================
+-- BALANCE FUNCTIONS (delegated to OrthCurrencyManager)
+-- =======================================================================================
+
+function PlayerDataManager.GetBalance(player: Player)
+	return OrthCurrencyManager.GetBalance(player)
+end
+
+function PlayerDataManager.AddOrth(player: Player, amount: number)
+	return OrthCurrencyManager.AddOrth(player, amount)
+end
+
+function PlayerDataManager.DeductOrth(player: Player, amount: number)
+	return OrthCurrencyManager.DeductOrth(player, amount)
+end
+
+function PlayerDataManager.EterniumGetBalance(player: Player)
+	return PremiumEterniumManager.GetBalance(player)
+end
+
+function PlayerDataManager.AddEternium(player: Player, amount: number)
+	return PremiumEterniumManager.AddEternium(player, amount)
+end
+
+function PlayerDataManager.DeductEternium(player: Player, amount: number)
+	return PremiumEterniumManager.DeductEternium(player, amount)
+end
+
+
+-- =======================================================================================
+-- ORE FUNCTIONS (delegated to OreCore)
+-- =======================================================================================
+
+function PlayerDataManager.GetOreInventory(player: Player)
+	return OreCore.GetOreInventory(player)
+end
+
+function PlayerDataManager.GetOreAmount(player: Player, oreName: string)
+	return OreCore.GetOreAmount(player, oreName)
+end
+
+function PlayerDataManager.AddOre(player: Player, oreName: string, amount: number, weight: number)
+	return OreCore.AddOre(player, oreName, amount, weight)
+end
+
+function PlayerDataManager.RemoveOre(player: Player, oreName: string, amount: number, weight: number)
+	return OreCore.RemoveOre(player, oreName, amount, weight)
+end
+
+function PlayerDataManager.SetOreAmount(player: Player, oreName: string, amount: number)
+	return OreCore.SetOreAmount(player, oreName, amount)
+end
+
+function PlayerDataManager.HasEnoughOre(player: Player, oreName: string, requiredAmount: number)
+	return OreCore.HasEnoughOre(player, oreName, requiredAmount)
+end
+
+function PlayerDataManager.GetTotalOreCount(player: Player)
+	return OreCore.GetTotalOreCount(player)
+end
+
+function PlayerDataManager.UpdateOreInventory(player, newOreInventory)
+	return OreCore.UpdateOreInventory(player, newOreInventory)
+end
+
+function PlayerDataManager.MigrateDecimalWeights(player)
+	return OreCore.MigrateDecimalWeights(player)
+end
+
+function PlayerDataManager.GetTotalOreWeight(player: Player)
+	return OreCore.GetTotalOreWeight(player)	
+end
+
+function PlayerDataManager.IsOverMaxWeight(player: Player)
+	return OreCore.IsOverMaxWeight(player, PlayerInventoryManager.GetMaxWeight(player))
+end
+
+function PlayerDataManager.CheckWeightStatus(player: Player)
+	return OreCore.CheckWeightStatus(player)
+end
+
+function PlayerDataManager.CheckAndNotifyOverweightStatus(player:Player)
+	return OreCore.CheckAndNotifyOverweightStatus(player)
+end
+
+-- =======================================================================================
+-- SMELTING FUNCTIONS (delegated to SmeltingManager)
+-- =======================================================================================
+
+function PlayerDataManager.StartSmelting(player: Player, oreNameToSmelt: string, amountToSmelt: number)
+	return SmeltingManager.StartSmelting(player, oreNameToSmelt, amountToSmelt)
+end
+
+function PlayerDataManager.GetSmeltingInfo(player: Player)
+	return SmeltingManager.GetSmeltingInfo(player)
+end
+
+function PlayerDataManager.CleanupPlayer(player: Player)
+	return SmeltingManager.CleanupPlayer(player)
+end
+
+
+-- =======================================================================================
+-- PICKAXE FUNCTIONS (delegated to ToolManager)
+-- =======================================================================================
+
+function PlayerDataManager.GetPickaxeInventory(player: Player)
+	return ToolManager.GetPickaxeInventory(player)
+end
+
+function PlayerDataManager.AddPickaxe(player: Player, pickaxeId: number, modifierId: number?)
+	return ToolManager.AddPickaxe(player, pickaxeId, modifierId)
+end
+
+function PlayerDataManager.RemovePickaxe(player: Player, pickaxeInstanceId: number)
+	return ToolManager.RemovePickaxe(player, pickaxeInstanceId)
+end
+
+function PlayerDataManager.GetPickaxe(player: Player, pickaxeInstanceId: number)
+	return ToolManager.GetPickaxe(player, pickaxeInstanceId)
+end
+
+function PlayerDataManager.UpdatePickaxeModifier(player: Player, pickaxeInstanceId: number, newModifierId: number)
+	return ToolManager.UpdatePickaxeModifier(player, pickaxeInstanceId, newModifierId)
+end
+
+function PlayerDataManager.HasPickaxe(player: Player, pickaxeId: number)
+	return ToolManager.HasPickaxe(player, pickaxeId)
+end
+
+function PlayerDataManager.GetPickaxeCount(player: Player, pickaxeId: number)
+	return ToolManager.GetPickaxeCount(player, pickaxeId)
+end
+
+function PlayerDataManager.GetTotalPickaxeCount(player: Player)
+	return ToolManager.GetTotalPickaxeCount(player)
+end
+
+function PlayerDataManager.GetPickaxeDurability(player: Player, pickaxeInstanceId: number)
+	return ToolManager.GetPickaxeDurability(player, pickaxeInstanceId)
+end
+
+function PlayerDataManager.UpdatePickaxeDurability(player: Player, pickaxeInstanceId: number, amount: number)
+	return ToolManager.UpdatePickaxeDurability(player, pickaxeInstanceId, amount)
+end
+
+function PlayerDataManager.HasDurability(player: Player, pickaxeInstanceId: number)
+	return ToolManager.HasDurability(player, pickaxeInstanceId)
+end
+
+function PlayerDataManager.SyncToolAttributes(player: Player, pickaxeInstanceId: number)
+	return ToolManager.SyncToolAttributes(player, pickaxeInstanceId)
+end
+
+-- =======================================================================================
+-- INVENTORY FUNCTIONS (delegated to PlayerInventoryManager)
+-- =======================================================================================
+
+function PlayerDataManager.InitializeInventory(profileData)
+	return PlayerInventoryManager.InitializeInventory(profileData)
+end
+
+function PlayerDataManager.SpawnItemsInBackpack(player: Player)
+	return PlayerInventoryManager.SpawnItemsInBackpack(player)
+end
+
+function PlayerDataManager.SpawnOresInBackpack(player: Player)
+	return PlayerInventoryManager.SpawnOresInBackpack(player)
+end
+
+function PlayerDataManager.SyncBackpackToInventory(player: Player)
+	return PlayerInventoryManager.SyncBackpackToInventory(player)
+end
+
+function PlayerDataManager.RemoveOreToolsFromBackpack(player: Player, oreName: string, quantity: number)
+	return PlayerInventoryManager.RemoveOreToolsFromBackpack(player, oreName, quantity)
+end
+
+function PlayerDataManager.GetWeightInfo(player: Player)
+	return PlayerInventoryManager.GetWeightInfo(player)
+end
+
+function PlayerDataManager.CanCollectOre(player: Player, oreName: string, amount: number, weight: number)
+	return PlayerInventoryManager.CanCollectOre(player, oreName, amount,weight)
+end
+
+-- =======================================================================================
+-- LAYER FUNCTIONS (delegated to LayerManager)
+-- =======================================================================================
+
+function PlayerDataManager.GetAccessibleLayers(player: Player)
+	return LayerManager.GetAccessibleLayers(player)
+end
+
+function PlayerDataManager.TeleportToLayer(player: Player, layerIndex: number, cost: number)
+	return LayerManager.TeleportToLayer(player, layerIndex, cost)
+end
+
+function PlayerDataManager.CheckAndUnlockNextLayer(player: Player)
+	return LayerManager.CheckAndUnlockNextLayer(player)
+end
+
+
+
+
+-- =======================================================================================
+-- COLLECTION FUNCTIONS (delegated to OreCollectionTracker)
+-- =======================================================================================
+
+function PlayerDataManager.GetCollection(player: Player)
+	return OreCollectionTracker.GetCollection(player)
+end
+
+function PlayerDataManager.GetCollectionAmount(player: Player, oreName: string)
+	return OreCollectionTracker.GetCollectionAmount(player, oreName)
+end
+
+function PlayerDataManager.AddToCollection(player: Player, oreName: string, amount: number)
+	return OreCollectionTracker.AddToCollection(player, oreName, amount)
+end
+
+function PlayerDataManager.GetTotalCollectionCount(player: Player)
+	return OreCollectionTracker.GetTotalCollectionCount(player)
+end
+
+function PlayerDataManager.GetCollectionVariety(player: Player)
+	return OreCollectionTracker.GetCollectionVariety(player)
+end
+
+function PlayerDataManager.GetTopCollectedOres(player: Player, limit: number?)
+	return OreCollectionTracker.GetTopCollectedOres(player, limit)
+end
+
+function PlayerDataManager.SetCollectionAmount(player: Player, oreName: string, amount: number)
+	return OreCollectionTracker.SetCollectionAmount(player, oreName, amount)
+end
+
+function PlayerDataManager.GetCollectionFortuneBonus(player: Player, oreName: string)
+	return OreCollectionTracker.GetCollectionFortuneBonus(player, oreName)
+end
+
+-- =======================================================================================
+-- PLAYTIME FUNCTIONS (delegated to PlaytimeManager)
+-- =======================================================================================
+
+function PlayerDataManager.GetPlayTime(player: Player)
+	return PlaytimeManager.GetPlayTime(player)
+end
+
+function PlayerDataManager.AddPlayTime(player: Player, seconds: number)
+	return PlaytimeManager.AddPlayTime(player, seconds)
+end
+
+function PlayerDataManager.SetPlayTime(player: Player, seconds: number)
+	return PlaytimeManager.SetPlayTime(player, seconds)
+end
+
+function PlayerDataManager.GetFormattedPlayTime(player: Player)
+	return PlaytimeManager.GetFormattedPlayTime(player)
+end
+
+-- =======================================================================================
+-- PET FUNCTIONS (delegated to PetManager)
+-- =======================================================================================
+
+function PlayerDataManager.GetPetInventory(player: Player)
+	return PetManager.GetPetInventory(player)
+end
+
+function PlayerDataManager.AddPet(player: Player, petId: number)
+	return PetManager.AddPet(player, petId)
+end
+
+function PlayerDataManager.RemovePet(player: Player, petInstanceId: string)
+	return PetManager.RemovePet(player, petInstanceId)
+end
+
+function PlayerDataManager.GetPet(player: Player, petInstanceId: string)
+	return PetManager.GetPet(player, petInstanceId)
+end
+function PlayerDataManager.GetPetById(player: Player, petInstanceId: string)
+	return PetManager.GetPetById(player, petInstanceId)
+end
+
+function PlayerDataManager.EquipPet(player: Player, petInstanceId: string?)
+	return PetManager.EquipPet(player, petInstanceId)
+end
+
+function PlayerDataManager.UnequipPet(player: Player)
+	return PetManager.UnequipPet(player)
+end
+
+function PlayerDataManager.GetEquippedPet(player: Player)
+	return PetManager.GetEquippedPet(player)
+end
+
+function PlayerDataManager.GetEquippedPetData(player: Player)
+	return PetManager.GetEquippedPetData(player)
+end
+
+function PlayerDataManager.ApplyPetStats(player: Player, petData)
+	return PetManager.ApplyPetStats(player, petData)
+end
+
+function PlayerDataManager.RemovePetStats(player: Player)
+	return PetManager.RemovePetStats(player)
+end
+
+function PlayerDataManager.AddPetXP(player: Player, petInstanceId: string, xp: number)
+	return PetManager.AddPetXP(player, petInstanceId, xp)
+end
+
+function PlayerDataManager.FeedPet(player: Player, petInstanceId: string)
+	return PetManager.FeedPet(player, petInstanceId)
+end
+
+function PlayerDataManager.GivePetFood(player: Player, foodId: number, amount: number)
+	return PetManager.GivePetFood(player, foodId, amount)
+end
+
+function PlayerDataManager.RemovePetFood(player: Player, foodId: number, amount: number)
+	return PetManager.RemovePetFood(player, foodId, amount)
+end
+
+function PlayerDataManager.FeedEquippedPet(player: Player, foodId: number)
+	return PetManager.FeedEquippedPet(player, foodId)
+end
+
+-- =======================================================================================
+-- GACHA FUNCTIONS (delegated to LootRollManager)
+-- =======================================================================================
+
+function PlayerDataManager.InitializeGachaData(profileData)
+	return LootRollManager.InitializeGachaData(profileData)
+end
+
+function PlayerDataManager.GetGachaData(player: Player, gachaType: string)
+	return LootRollManager.GetGachaData(player, gachaType)
+end
+
+function PlayerDataManager.PullSingleArtifact(player: Player)
+	return LootRollManager.PullSingleArtifact(player)
+end
+
+function PlayerDataManager.PullTenArtifacts(player: Player)
+	return LootRollManager.PullTenArtifacts(player)
+end
+
+function PlayerDataManager.GetPityInfo(player: Player, gachaType: string)
+	return LootRollManager.GetPityInfo(player, gachaType)
+end
+
+function PlayerDataManager.GetGachaStats(player: Player, gachaType: string)
+	return LootRollManager.GetGachaStats(player, gachaType)
+end
+
+function PlayerDataManager.GetCurrentDropRates(player: Player, gachaType: string?)
+	return LootRollManager.GetCurrentDropRates(player, gachaType)
+end
+
+function PlayerDataManager.ResetPityCounters(player: Player, gachaType: string)
+	return LootRollManager.ResetPityCounters(player, gachaType)
+end
+
+-- =======================================================================================
+-- ARTIFACTS FUNCTIONS (delegated to ArtifactsManager)
+-- =======================================================================================
+
+function PlayerDataManager.EquipArtifact(player, artifactInstanceId, slotIndex)
+	return RelicCore.EquipArtifact(player, artifactInstanceId, slotIndex)
+end
+
+function PlayerDataManager.UnequipArtifact(player, slotIndex)
+	return RelicCore.UnequipArtifact(player, slotIndex)
+end
+
+function PlayerDataManager.AddArtifact(player, artifactId, tier, level)
+	return RelicCore.AddArtifact(player, artifactId, tier, level)
+end
+
+function PlayerDataManager.GetArtifact(player, artifactInstanceId)
+	return RelicCore.GetArtifact(player, artifactInstanceId)
+end
+
+function PlayerDataManager.RemoveArtifact(player, artifactInstanceId)
+	return RelicCore.RemoveArtifact(player, artifactInstanceId)
+end
+
+function PlayerDataManager.CanEquipArtifact(player, artifactInstanceId)
+	return RelicCore.CanEquipArtifact(player, artifactInstanceId)
+end
+
+function PlayerDataManager.ApplyArtifactStats(player)
+	return RelicCore.ApplyArtifactStats(player)
+end
+
+function PlayerDataManager.CalculateTotalStats(player)
+	return RelicCore.CalculateTotalStats(player)
+end
+
+function PlayerDataManager.RemoveArtifactStats(player)
+	return RelicCore.RemoveArtifactStats(player)
+end
+
+function PlayerDataManager.GetArtifactInventory(player)
+	return RelicCore.GetArtifactInventory(player)
+end
+
+function PlayerDataManager.GetEquippedArtifacts(player)
+	return RelicCore.GetEquippedArtifacts(player)
+end
+
+function PlayerDataManager.GetEquippedArtifactData(player)
+	return RelicCore.GetEquippedArtifactData(player)
+end
+
+function PlayerDataManager.GetEquippedArtifactInSlot(player, slotIndex)
+	return RelicCore.GetEquippedArtifactInSlot(player, slotIndex)
+end
+
+function PlayerDataManager.GetMaxSlotsForPlayer(player)
+	return RelicCore.GetMaxSlotsForPlayer(player)
+end
+
+
+
+-- =======================================================================================
+-- EGG FUNCTIONS (delegated to PetEggManager)
+-- =======================================================================================
+
+function PlayerDataManager.AddEggToInventory(player, eggId)
+	return PetEggManager.AddEggToInventory(player, eggId)
+end
+
+function PlayerDataManager.GetEggInventory(player)
+	return PetEggManager.GetEggInventory(player)
+end
+
+function PlayerDataManager.RemoveEggFromInventory(player, eggInstanceId)
+	return PetEggManager.RemoveEggFromInventory(player, eggInstanceId)
+end
+
+function PlayerDataManager.GetIncubator(player)
+	return PetEggManager.GetIncubator(player)
+end
+
+function PlayerDataManager.PlaceEggInIncubator(player, eggInstanceId, slotIndex)
+	return PetEggManager.PlaceEggInIncubator(player, eggInstanceId, slotIndex)
+end
+
+function PlayerDataManager.ClaimHatchedPet(player, slotIndex)
+	return PetEggManager.ClaimHatchedPet(player, slotIndex)
+end
+
+function PlayerDataManager.UnlockIncubatorSlot(player)
+	return PetEggManager.UnlockIncubatorSlot(player)
+end
+
+function PlayerDataManager.InstantHatchEgg(player, slotIndex)
+	return PetEggManager.InstantHatchEgg(player, slotIndex)
+end
+
+-- =======================================================================================
+-- EGG SHOP FUNCTIONS (delegated to ShopManager)
+-- =======================================================================================
+
+function PlayerDataManager.GetGlobalDataAsync()
+	return ShopManager.GetGlobalDataAsync()
+end
+
+function PlayerDataManager.SetGlobalDataAsync(data)
+	return ShopManager.SetGlobalDataAsync(data)
+end
+
+function PlayerDataManager.GetEggShopStock(player)
+	return ShopManager.GetEggShopStock(player)
+end
+
+function PlayerDataManager.SetEggShopStock(player, stock)
+	return ShopManager.SetEggShopStock(player, stock)
+end
+
+function PlayerDataManager.GetLastSeenRestockTime(player)
+	return ShopManager.GetLastSeenRestockTime(player)
+end
+
+function PlayerDataManager.SetLastSeenRestockTime(player, time)
+	return ShopManager.SetLastSeenRestockTime()
+end
+
+-- =======================================================================================
+-- RECIPE FUNCTIONS (delegated to RecipeManager)
+-- =======================================================================================
+
+function PlayerDataManager.GetUnlockedRecipes(player: Player)
+	return RecipeManager.GetUnlockedRecipes(player)
+end
+
+function PlayerDataManager.HasRecipe(player: Player, recipeId: string)
+	return RecipeManager.HasRecipe(player, recipeId)
+end
+
+function PlayerDataManager.UnlockRecipe(player: Player, recipeId: string)
+	return RecipeManager.UnlockRecipe(player, recipeId)
+end
+
+-- =======================================================================================
+-- CAVE LOOT TRACKER
+-- =======================================================================================
+
+
+function PlayerDataManager:InitCaveLootTracker()
+	CaveLootTracker:Init(self)
+end
+
+-- Add these functions to the public API
+function PlayerDataManager.StartCaveSession(player)
+	return CaveLootTracker:StartCaveSession(player)
+end
+
+function PlayerDataManager.HandleCaveSafeExit(player)
+	return CaveLootTracker:HandleSafeExit(player)
+end
+
+function PlayerDataManager.HandleCaveDeath(player)
+	return CaveLootTracker:HandleDeath(player)
+end
+
+function PlayerDataManager.TrackCaveLoot(player, itemType, itemData)
+	return CaveLootTracker:TrackTemporaryLoot(player, itemType, itemData)
+end
+
+function PlayerDataManager.HandlePrematureExit(player)
+	return CaveLootTracker:HandlePrematureExit(player)
+end
+
+return PlayerDataManager
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TeleportService = game:GetService("TeleportService")
+local PlayerDataManager = require(script.Parent.SSS.Data.PlayerDataManager)
+
+local ExitCaveEvent = Instance.new("RemoteEvent")
+ExitCaveEvent.Name = "ExitCaveEvent"
+ExitCaveEvent.Parent = ReplicatedStorage
+
+local PrematureExitEvent = Instance.new("RemoteEvent")
+PrematureExitEvent.Name = "PrematureExitEvent"
+PrematureExitEvent.Parent = ReplicatedStorage
+
+local LOBBY_PLACE_ID = 89220480336777 -- replace with your lobby place id
+
+ExitCaveEvent.OnServerEvent:Connect(function(player)
+	-- Handle safe exit loot
+	PlayerDataManager.HandleCaveSafeExit(player)
+
+	-- Teleport back to lobby
+	TeleportService:Teleport(LOBBY_PLACE_ID, player)
+end)
+
+PrematureExitEvent.OnServerEvent:Connect(function(player)
+	PlayerDataManager.HandlePrematureExit(player)
+	TeleportService:Teleport(LOBBY_PLACE_ID, player)
+end)
+
+-- PlayerData Module (Restructured for clarity, same functionality)
+
+-- Inventory Section
+local Inventory = {
+	Ores = {
+		["Dirt"] = { weights = {} },
+		["Stone"] = { weights = {} },
+		["Coal"] = { weights = {} },
+		["Tin"] = { weights = {} },
+		["Copper"] = { weights = {} },
+		["Iron"] = { weights = {} },
+		["Quartz"] = { weights = {} },
+		["Gold"] = { weights = {} },
+		["Platinum"] = { weights = {} },
+		["Opal"] = { weights = {} },
+		["Jade"] = { weights = {} },
+		["Aquamarine"] = { weights = {} },
+		["Amethyst"] = { weights = {} },
+		["Ruby"] = { weights = {} },
+		["Obsidian"] = { weights = {} },
+		["Diamond"] = { weights = {} },
+		["Mythril"] = { weights = {} },
+		["Orichalcum"] = { weights = {} },
+		["Soulite"] = { weights = {} },
+		["Void Shard"] = { weights = {} },
+		["God Orb"] = { weights = {} },
+		["Eternite"] = { weights = {} },
+		["Infinity Ore"] = { weights = {} },
+		["Clay Brick"] = { weights = {} },
+		["Stone Block"] = { weights = {} },
+		["Tin Ingot"] = { weights = {} },
+		["Copper Ingot"] = { weights = {} },
+		["Iron Ingot"] = { weights = {} },
+		["Refined Quartz"] = { weights = {} },
+		["Gold Ingot"] = { weights = {} },
+		["Platinum Ingot"] = { weights = {} },
+		["Polished Opal"] = { weights = {} },
+		["Polished Jade"] = { weights = {} },
+		["Polished Aquamarine"] = { weights = {} },
+		["Polished Amethyst"] = { weights = {} },
+		["Polished Ruby"] = { weights = {} },
+		["Obsidian Shard"] = { weights = {} },
+		["Diamond Core"] = { weights = {} },
+		["Mythril Ingot"] = { weights = {} },
+		["Orichalcum Ingot"] = { weights = {} },
+		["Soulite Crystal"] = { weights = {} },
+		["Void Essence"] = { weights = {} },
+		["Charged God Orb"] = { weights = {} },
+		["Eternite Bar"] = { weights = {} },
+		["Infinity Ingot"] = { weights = {} },
+	},
+	Pickaxe = {
+		{
+			durability = 150,
+			modifierId = 0,
+			pickaxeId = 1,
+			id = 1,
+			maxDurability = 150
+		}
+	},
+	Eggs = {},
+	PetFood = {},
+}
+
+-- Pets Section
+local Pets = {
+	Owned = {},
+	Equipped = nil,
+}
+
+-- EggShop Section
+local EggShop = {
+	LastRotation = 0,
+	CurrentStock = {},
+	DailyDeals = {},
+}
+
+-- MaxWeight Section
+local MaxWeight = {
+	current = 100,
+	level = 1,
+	upgrades = {
+		[1] = 100, [2] = 200, [3] = 350, [4] = 500, [5] = 750,
+		[6] = 1000, [7] = 1500, [8] = 2000, [9] = 3000, [10] = 5000,
+	}
+}
+
+-- UnlockedLayers Section
+local UnlockedLayers = {}
+for i = 1, 22 do
+	UnlockedLayers[i] = (i == 1)
+end
+
+-- Artifacts Section
+local Artifacts = {
+	Slots = {
+		current = 8,
+	},
+	Inventory = {},
+	Equipped = {},
+	Collection = {},
+	UpgradeMaterials = {
+		EterniumDust = 0,
+		EnhancementStones = 0,
+	}
+}
+
+-- GachaData Section
+local GachaData = {
+	Artifacts = {
+		TotalPulls = 0,
+		PityCounters = {
+			Epic = 0,
+			Legendary = 0,
+			Mythic = 0,
+			Divine = 0,
+			Titan = 0
+		},
+		LastPullTime = 0,
+		PullHistory = {}
+	}
+}
+
+-- Main PlayerData Table
+local PlayerData = {
+	Orth = 0,
+	Eternium = 0,
+	Inventory = Inventory,
+	Collection = {},
+	PlayTime = 0,
+	Pets = Pets,
+	EggShop = EggShop,
+	MaxWeight = MaxWeight,
+	UnlockedLayers = UnlockedLayers,
+	Artifacts = Artifacts,
+	GachaData = GachaData,
+}
+
+return PlayerData
+
