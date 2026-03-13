@@ -1,0 +1,77 @@
+import tkinter as tk
+
+window = tk.Tk()
+window.geometry("300x300")
+window.config(bg="light blue")
+window.title("Calculator")
+# Functions
+def equate(mode):
+    if mode == "1":
+        first = int(firstNumberEntry.get())
+        second = int(secondNumberEntry.get())
+
+        sum = first + second
+        string = "The sum of"
+        operation = "+"
+        updateText(sum, first, second, operation, string)
+    elif mode == "2":
+        first = int(firstNumberEntry.get())
+        second = int(secondNumberEntry.get())
+        string = "The product of"
+        sum = first * second
+        operation = "*"
+        updateText(sum, first, second, operation, string)
+    elif mode == "3":
+        first = int(firstNumberEntry.get())
+        second = int(secondNumberEntry.get())
+        string = "The difference of"
+        sum = first - second
+        operation = "-"
+        updateText(sum, first, second, operation, string)
+    elif mode == "4":
+        first = int(firstNumberEntry.get())
+        second = int(secondNumberEntry.get())
+        string = "The quotient of"
+        sum = first // second
+        operation = "/"
+        updateText(sum, first, second, operation, string)
+
+
+topFrame = tk.Frame(window, bg="white", height=50)
+topFrame.pack(fill="x")
+
+equationLabel = tk.Label(topFrame, text="Equation here", bg="white")
+equationLabel.pack(anchor="center", padx=20,pady=20)
+
+bottomFrame = tk.Frame(window, height=50, bg="light blue")
+bottomFrame.pack(fill="x")
+
+firstNumber = tk.Label(bottomFrame, text="Enter 1st Number")
+firstNumber.grid(row=2, column=3, columnspan=2, padx=5, pady=10)
+
+secondNumber = tk.Label(bottomFrame, text="Enter 2st Number")
+secondNumber.grid(row=3, column=3, columnspan=2, padx=30, pady=10)
+
+firstNumberEntry = tk.Entry(bottomFrame)
+firstNumberEntry.grid(row=2, column=5, columnspan=1, pady=10)
+
+secondNumberEntry = tk.Entry(bottomFrame)
+secondNumberEntry.grid(row=3, column=5, columnspan=1, pady=10)
+
+addButton = tk.Button(bottomFrame, text="Add", width=8, command=lambda:equate("1"))
+addButton.grid(row=4, column=2, columnspan=3, pady=10)
+
+multiplyButton = tk.Button(bottomFrame, text="Multiply", width=8, command=lambda:equate("2"))
+multiplyButton.grid(row=5, column=2, columnspan=3, pady=10)
+
+subractButton = tk.Button(bottomFrame, text="Subtract", width=8, command=lambda:equate("3"))
+subractButton.grid(row=4, column=5, pady=10)
+
+divideButton = tk.Button(bottomFrame, text="Divide", width=8, command=lambda:equate("4"))
+divideButton.grid(row=5, column=5, pady=10)
+
+def updateText(sum, first, second, operation, string):
+    equationLabel.config(text=f"{string} {first} {operation} {second} is {sum}.")
+
+
+window.mainloop()
